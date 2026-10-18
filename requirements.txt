@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+psycopg[binary]
+python-multipart
+itsdangerous
+pwdlib[argon2]
+python-dotenv
+openpyxl
