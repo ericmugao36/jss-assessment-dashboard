@@ -1,10 +1,25 @@
+
+# Python virtual environments
 .venv/
 .venv-2/
+venv/
+
+# Python cache
 __pycache__/
 *.py[cod]
+
+# Secret credentials
 .env
 .env.*
 !.env.example
-.vscode/
-*.db
+
+# Private data and spreadsheets
 *.xlsx
+*.csv
+
+# Saved machine learning models
+*.pkl
+*.joblib
+
+# Local editor settings
+.vscode/
