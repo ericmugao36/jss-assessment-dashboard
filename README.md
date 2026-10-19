@@ -1,10 +1,10 @@
-# JSS Assessment Dashboard
+# Assessment Dashboard
 
 A web-based school assessment management system built with Python and FastAPI. The project is designed to help teachers manage learner assessment information and allow parents to view their children's academic progress through separate role-based portals.
 
 ## Overview
 
-The JSS Assessment Dashboard provides a central place to manage learner records, assessment results, and teacher feedback. It separates teacher and parent access while using a shared application and database.
+The Assessment Dashboard provides a central place to manage learner records, assessment results, and teacher feedback. It separates teacher and parent access while using a shared application and database.
 
 This is a project under active development.
 
