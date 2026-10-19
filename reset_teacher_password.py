@@ -1,3 +1,4 @@
+from getpass import getpass
 
 from dotenv import load_dotenv
 from sqlalchemy import select
@@ -9,7 +10,9 @@ load_dotenv()
 passwords = PasswordHash.recommended()
 
 email = input("Enter teacher email: ").strip().lower()
-new_password = input("Enter new password (at least 12 characters): ")
+new_password = getpass(
+    "Enter new password (at least 12 characters): "
+)
 
 if len(new_password) < 12:
     print("Password must contain at least 12 characters.")

@@ -23,3 +23,22 @@ __pycache__/
 
 # Local editor settings
 .vscode/
+.DS_Store
+Thumbs.db
+
+# Logs and backups
+*.log
+*.bak
+*.backup
+
+# Local school databases
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+*.db-
+
+# Local application backups
+backupapp.py
+app.py.local-backup
