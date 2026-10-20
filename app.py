@@ -128,6 +128,80 @@ class Base(DeclarativeBase):
     pass
 
 
+class School(Base):
+    __tablename__ = "schools"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+
+    name: Mapped[str] = mapped_column(
+        String(200),
+        nullable=False,
+        index=True,
+    )
+
+    # Maximum number of active teachers allowed.
+    teacher_limit: Mapped[int] = mapped_column(
+        Integer,
+        default=100,
+        nullable=False,
+    )
+
+    # Possible values: active, suspended.
+    status: Mapped[str] = mapped_column(
+        String(20),
+        default="active",
+        nullable=False,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        nullable=False,
+    )
+
+
+class SchoolClass(Base):
+    __tablename__ = "school_classes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+
+    school_id: Mapped[int] = mapped_column(
+        ForeignKey("schools.id"),
+        nullable=False,
+        index=True,
+    )
+
+    name: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+    )
+
+    grade: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+    )
+
+
+class TeacherClassAssignment(Base):
+    __tablename__ = "teacher_class_assignments"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+
+    teacher_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id"),
+        nullable=False,
+        index=True,
+    )
+
+    class_id: Mapped[int] = mapped_column(
+        ForeignKey("school_classes.id"),
+        nullable=False,
+        index=True,
+    )
+
+
+
+
 parent_links = Table(
     "parent_links",
     Base.metadata,
@@ -141,6 +215,11 @@ class User(Base):
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    school_id: Mapped[int | None] = mapped_column(
+        ForeignKey("schools.id"),
+        nullable=True,
+        index=True,
+    )
     name: Mapped[str | None] = mapped_column(
         String(160), nullable=True
     )
@@ -160,12 +239,23 @@ class Student(Base):
     __tablename__ = "students"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+
     name: Mapped[str] = mapped_column(String(160))
+
     grade: Mapped[int] = mapped_column(Integer)
+
     admission: Mapped[str | None] = mapped_column(
-        String(80), unique=True, index=True, nullable=True
+        String(80),
+        unique=True,
+        index=True,
+        nullable=True,
     )
 
+    school_id: Mapped[int | None] = mapped_column(
+        ForeignKey("schools.id"),
+        nullable=True,
+        index=True,
+    )
     parents: Mapped[list[User]] = relationship(
         secondary=parent_links,
         back_populates="children",
@@ -249,6 +339,106 @@ class ImportBatch(Base):
 
 Base.metadata.create_all(engine)
 
+# ============================================================
+#2b MULTI-SCHOOL MIGRATION: USER SCHOOL ASSOCIATION
+# ============================================================
+
+from sqlalchemy import inspect, text
+
+with engine.begin() as connection:
+    inspector = inspect(connection)
+
+    # Add school_id only if it does not already exist.
+    user_columns = {
+        column["name"]
+        for column in inspector.get_columns("users")
+    }
+
+    if "school_id" not in user_columns:
+        connection.execute(
+            text(
+                "ALTER TABLE users "
+                "ADD COLUMN school_id INTEGER "
+                "REFERENCES schools(id)"
+            )
+        )
+
+    # Create the initial Yuri Academy school record if needed.
+    school_id = connection.execute(
+        text(
+            "SELECT id FROM schools "
+            "WHERE name = :name LIMIT 1"
+        ),
+        {"name": "Yuri Academy"},
+    ).scalar_one_or_none()
+
+    if school_id is None:
+        connection.execute(
+            text(
+                """
+               INSERT INTO schools (
+    name,
+    teacher_limit,
+    status,
+    created_at
+)
+VALUES (
+    :name,
+    :teacher_limit,
+    :status,
+    :created_at
+)
+                """
+            ),
+            {
+                "name": "Yuri Academy",
+                "teacher_limit": 100,
+                "status": "active",
+                "created_at": datetime.utcnow(),
+            },
+        )
+
+        school_id = connection.execute(
+            text(
+                "SELECT id FROM schools "
+                "WHERE name = :name LIMIT 1"
+            ),
+            {"name": "Yuri Academy"},
+        ).scalar_one()
+
+    # Associate existing users with Yuri Academy.
+    connection.execute(
+        text(
+            "UPDATE users SET school_id = :school_id "
+            "WHERE school_id IS NULL"
+        ),
+        {"school_id": school_id},
+    )
+
+    # Add school_id to existing students table if missing.
+    student_columns = {
+        column["name"]
+        for column in inspect(connection).get_columns("students")
+    }
+
+    if "school_id" not in student_columns:
+        connection.execute(
+            text(
+                "ALTER TABLE students "
+                "ADD COLUMN school_id INTEGER "
+                "REFERENCES schools(id)"
+            )
+        )
+
+    # Assign existing learners to Yuri Academy.
+    connection.execute(
+        text(
+            "UPDATE students SET school_id = :school_id "
+            "WHERE school_id IS NULL"
+        ),
+        {"school_id": school_id},
+    )
+
 
 # ============================================================
 # 3. HELPER FUNCTIONS
@@ -296,6 +486,7 @@ def current_user(request: Request, db):
     return db.get(User, int(user_id))
 
 
+
 def require_role(request: Request, db, role: str):
     user = current_user(request, db)
 
@@ -311,7 +502,24 @@ def require_role(request: Request, db, role: str):
             detail="You do not have permission to access this page.",
         )
 
+    # Teachers and parents must belong to an active school.
+    if role in {"teacher", "parent"}:
+        if not user.school_id:
+            raise HTTPException(
+                status_code=403,
+                detail="Your account is not assigned to a school.",
+            )
+
+        school = db.get(School, user.school_id)
+
+        if not school or school.status != "active":
+            raise HTTPException(
+                status_code=403,
+                detail="Your school is inactive or unavailable.",
+            )
+
     return user
+
 
 
 def get_setting(db, key, default):
@@ -428,6 +636,18 @@ body {{ margin:0; background:var(--page); color:var(--text); font:15px Arial,san
     display: block;
     margin: 6px 10px 10px 232px;
 }}
+/* Dark blue styling for the Total Learners widget */
+.total-learners-widget .flip-card-front {{
+    background: #12345A;
+    color: #FFFFFF;
+}}
+
+.total-learners-widget .flip-card-front h2,
+.total-learners-widget .flip-card-front p,
+.total-learners-widget .flip-card-front .stat-label,
+.total-learners-widget .flip-card-front .stat-value {{
+    color: #FFFFFF;
+}}
 
 
 .sidebar {{
@@ -469,7 +689,7 @@ section {{ background:var(--surface); color:var(--text); padding:14px; margin:8p
     min-width: 0;
 }}
 
-.stat-card {{
+.total-learners-widget .stat-card {{
     min-height: 125px;
 }}
 
@@ -479,7 +699,7 @@ section {{ background:var(--surface); color:var(--text); padding:14px; margin:8p
     margin: 0 0 8px;
 }}
 
-.stat-card h2 {{
+.total-learners-widget .stat-card h2 {{
     font-size: 25px;
     overflow-wrap: anywhere;
     margin: 5px 0 10px;
@@ -502,27 +722,28 @@ section {{ background:var(--surface); color:var(--text); padding:14px; margin:8p
 }}
 
 .chart-y-axis {{
-    height: 260px;
+    box-sizing: border-box;
+    height: 177px;
+    min-height: 177px;
+    padding: 0 0 27px;
     display: flex;
     flex-direction: column;
     justify-content: space-between;
     align-items: flex-end;
     font-size: 12px;
+    line-height: 1.2;
     color: var(--muted);
-    padding-bottom: 27px;
 }}
 
-.chart-main {{
-    min-width: 0;
-    overflow-x: auto;
-}}
 
 .chart-plot {{
+    box-sizing: border-box;
+    width: 100%;
     min-width: 360px;
-    height: 260px;
+    height: 177px;
     display: flex;
     align-items: stretch;
-    gap: 12px;
+    gap: 10px;
     background:
         repeating-linear-gradient(
             to top,
@@ -531,19 +752,26 @@ section {{ background:var(--surface); color:var(--text); padding:14px; margin:8p
             var(--border) calc(20% - 1px),
             var(--border) 20%
         );
+    background-size: 100% 150px;
+    background-position: left bottom;
+    background-repeat: no-repeat;
     border-bottom: 1px solid var(--border);
 }}
 
+
 .subject-column {{
-    flex: 1;
+    flex: 1 1 0;
     min-width: 58px;
     height: 100%;
     position: relative;
 }}
 
+
 .subject-plot-column {{
-    height: calc(100% - 27px);
+    height: 150px;
+    min-height: 150px;
     position: relative;
+    box-sizing: border-box;
 }}
 
 .subject-bar {{
@@ -554,7 +782,11 @@ section {{ background:var(--surface); color:var(--text); padding:14px; margin:8p
     background: #3b82f6;
     border-radius: 5px 5px 0 0;
     min-height: 0;
+    box-sizing: border-box;
+    border: 1px solid #1d4ed8;
+    box-sizing: border-box;
 }}
+
 
 .subject-value {{
     position: absolute;
@@ -665,6 +897,758 @@ main {{
     height: auto;
     min-height: 0;
     overflow: visible;
+}}
+
+
+/* Professional appearance upgrade */
+:root {{
+    --page: #f3f6fb;
+    --surface: #ffffff;
+    --surface-alt: #eaf0f8;
+    --text: #172338;
+    --muted: #64748b;
+    --border: #dbe4f0;
+    --navy: #163b65;
+    --navy-hover: #24568a;
+    --link: #245fa6;
+    --sidebar: #ffffff;
+    --shadow: 0 5px 18px rgba(25, 48, 80, 0.07);
+}}
+
+body {{
+    font-family: "Segoe UI", Arial, sans-serif;
+    font-size: 14px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+}}
+
+.topbar {{
+    min-height: 64px;
+    padding: 12px 22px;
+    border-radius: 0 0 14px 14px;
+    box-shadow: 0 4px 14px rgba(15, 35, 65, 0.14);
+}}
+
+.brand {{
+    font-size: 16px;
+    letter-spacing: 0.2px;
+}}
+
+.brand small {{
+    font-size: 11px;
+    font-weight: normal;
+    opacity: 0.85;
+}}
+
+.sidebar {{
+    background: var(--surface);
+    border-color: var(--border);
+    box-shadow: var(--shadow);
+    padding: 18px 12px;
+}}
+
+.side-label {{
+    letter-spacing: 1px;
+    font-size: 11px;
+    color: var(--muted);
+}}
+
+.side-link {{
+    min-height: 40px;
+    padding: 10px 11px;
+    border-radius: 8px;
+    transition: background 0.18s ease, color 0.18s ease;
+}}
+
+.side-link:hover {{
+    background: var(--surface-alt);
+    color: var(--link);
+}}
+
+main h1 {{
+    font-size: 27px;
+    line-height: 1.3;
+    letter-spacing: -0.5px;
+    margin-bottom: 14px;
+}}
+
+h2 {{
+    font-size: 19px;
+    line-height: 1.4;
+}}
+
+section {{
+    padding: 19px;
+    margin: 12px 0;
+    border-radius: 13px;
+    border-color: var(--border);
+    box-shadow: var(--shadow);
+}}
+
+.dashboard-widgets {{
+    gap: 16px;
+    margin: 16px 0;
+}}
+
+.stat-card {{
+    min-height: 135px;
+    transition: box-shadow 0.2s ease, transform 0.2s ease;
+}}
+
+.stat-card:hover {{
+    box-shadow: 0 9px 24px rgba(25, 48, 80, 0.11);
+    transform: translateY(-2px);
+}}
+
+.stat-card h2 {{
+    font-size: 29px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+}}
+
+button,
+.button,
+.dashboard-button {{
+    border-radius: 8px;
+    font-weight: 600;
+    transition: background 0.18s ease, box-shadow 0.18s ease;
+}}
+
+button:focus-visible,
+.button:focus-visible,
+.dashboard-button:focus-visible,
+.side-link:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {{
+    outline: 3px solid #78aef5;
+    outline-offset: 2px;
+}}
+
+input,
+select,
+textarea {{
+    border-radius: 8px;
+    padding: 11px 12px;
+}}
+
+input:focus,
+select:focus,
+textarea:focus {{
+    border-color: #5289cb;
+    box-shadow: 0 0 0 3px rgba(82, 137, 203, 0.13);
+}}
+
+.table {{
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow-x: auto;
+}}
+
+table {{
+    background: var(--surface);
+}}
+
+th {{
+    font-weight: 700;
+    color: var(--text);
+}}
+
+.note {{
+    border: 1px solid var(--border);
+    border-radius: 10px;
+}}
+
+@media (max-width: 600px) {{
+    .topbar {{
+        padding: 10px 12px;
+    }}
+
+    main h1 {{
+        font-size: 23px;
+    }}
+
+    section {{
+        padding: 14px;
+    }}
+
+    .stat-card h2 {{
+        font-size: 25px;
+    }}
+}}
+
+
+/* Dashboard analytics polish */
+.dashboard-welcome {{
+    color: var(--muted);
+    font-size: 15px;
+    max-width: 760px;
+    margin: 0 0 22px;
+}}
+
+.dashboard-widgets {{
+    align-items: stretch;
+    gap: 18px;
+}}
+
+.stat-card {{
+    position: relative;
+    overflow: hidden;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-top: 3px solid #3978bd;
+    border-radius: 12px;
+    padding: 20px;
+}}
+
+.stat-card:nth-child(2) {{
+    border-top-color: #159a80;
+}}
+
+.stat-card:nth-child(3) {{
+    border-top-color: #805ad5;
+}}
+
+.stat-card:nth-child(4) {{
+    border-top-color: #d69e2e;
+}}
+
+.stat-card .summary-label {{
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.65px;
+    text-transform: uppercase;
+    margin-bottom: 12px;
+}}
+
+.stat-card h2 {{
+    line-height: 1.3;
+    margin: 0 0 12px;
+    overflow-wrap: anywhere;
+}}
+
+.stat-card > span,
+.stat-card > a {{
+    font-size: 13px;
+}}
+
+.stat-card > span {{
+    color: var(--muted);
+}}
+
+.stat-card > a {{
+    display: inline-block;
+    margin-top: 4px;
+    font-weight: 600;
+    text-decoration: none;
+}}
+
+.stat-card > a:hover {{
+    text-decoration: underline;
+}}
+
+.chart-widget h2 {{
+    margin-top: 0;
+    margin-bottom: 4px;
+}}
+
+.chart-widget > p {{
+    line-height: 1.5;
+    margin-top: 4px;
+}}
+
+.chart-plot {{
+    border-radius: 8px 8px 0 0;
+}}
+
+.subject-bar {{
+    transition: opacity 0.2s ease;
+}}
+
+.subject-column:hover .subject-bar {{
+    opacity: 0.8;
+}}
+
+
+/* Square Windows-style flip tiles */
+
+/* Compact Windows-style flip tiles */
+/* Two tiles per row */
+.dashboard-widgets {{
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+    align-items: stretch;
+    margin: 12px 0;
+}}
+
+/* Each tile */
+.dashboard-widgets {{
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+    align-items: stretch;
+    margin: 10px 0;
+}}
+
+.dashboard-widgets > .flip-card {{
+    width: 100%;
+    height: 145px;
+    min-height: 0;
+    aspect-ratio: auto;
+    perspective: 1000px;
+    background: transparent;
+    border: 0;
+    padding: 0;
+    margin: 0;
+}}
+
+.flip-card-inner {{
+    position: relative;
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+    transform-style: preserve-3d;
+    transition: transform 0.6s ease;
+}}
+
+.flip-card-face {{
+    position: absolute;
+    inset: 0;
+    box-sizing: border-box;
+    width: 100%;
+    height: 100%;
+    padding: 12px;
+    overflow: auto;
+    border-radius: 12px;
+    backface-visibility: hidden;
+    -webkit-backface-visibility: hidden;
+}}
+
+.flip-card-front {{
+    transform: rotateY(0deg);
+}}
+
+.flip-card-back {{
+    transform: rotateY(180deg);
+}}
+
+.flip-card-inner {{
+    transition: transform 0.5s;
+    transform-style: preserve-3d;
+}}
+
+/* Do not flip automatically on hover or focus */
+.flip-card:hover .flip-card-inner,
+.flip-card:focus-within .flip-card-inner {{
+    transform: none;
+}}
+
+/* Flip only when the widget is clicked */
+.flip-card.is-flipped .flip-card-inner {{
+    transform: rotateY(180deg);
+}}
+
+/* Keep the clicked widget flipped even while hovered */
+.flip-card.is-flipped:hover .flip-card-inner,
+.flip-card.is-flipped:focus-within .flip-card-inner {{
+    transform: rotateY(180deg);
+}}
+
+
+/* Both faces occupy the same plane */
+.flip-card-face {{
+    position: absolute;
+    inset: 0;
+    box-sizing: border-box;
+    width: 100%;
+    height: 100%;
+    backface-visibility: hidden;
+    -webkit-backface-visibility: hidden;
+    border-radius: 12px;
+    padding: 14px;
+    overflow: auto;
+}}
+
+.flip-card-front {{
+    transform: rotateY(0deg);
+}}
+
+.flip-card-back {{
+    transform: rotateY(180deg);
+}}
+
+.flip-card:nth-child(2) .flip-card-front {{ background: #147d70; }}
+.flip-card:nth-child(3) .flip-card-front {{ background: #6246a5; }}
+.flip-card:nth-child(4) .flip-card-front {{ background: #a66a12; }}
+
+.flip-card-front .summary-label {{
+    color: #ffffff;
+    opacity: 0.9;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    margin: 0;
+}}
+
+.flip-card-front h2 {{
+    color: #ffffff;
+    font-size: clamp(17px, 1.6vw, 25px);
+    line-height: 1.2;
+    margin: 0;
+}}
+
+.flip-card-front span,
+.flip-card-front a {{
+    color: #ffffff;
+    font-size: 11px;
+}}
+
+.flip-card-front a {{
+    font-weight: 700;
+}}
+
+.flip-card-back {{
+    color: var(--text);
+    background: var(--surface);
+    border-top: 3px solid var(--navy);
+    transform: rotateY(180deg);
+}}
+
+.flip-card-back h2 {{
+    font-size: 15px;
+    line-height: 1.3;
+    margin: 0;
+}}
+
+.flip-card-back p {{
+    color: var(--muted);
+    font-size: 11px;
+    line-height: 1.4;
+    margin: 0;
+}}
+
+.flip-card-back a {{
+    font-size: 11px;
+    font-weight: 700;
+    text-decoration: none;
+}}
+
+/* Make the graph compact so it fits beneath the tiles */
+.chart-widget {{
+    grid-column: 1 / -1;
+    padding: 12px !important;
+    margin: 0 !important;
+}}
+
+.chart-widget h2 {{
+    font-size: 17px;
+    margin: 0 0 3px;
+}}
+
+.chart-widget > p {{
+    font-size: 12px;
+    margin: 3px 0 8px;
+}}
+
+.chart-plot {{
+    min-height: 130px;
+    max-height: 160px;
+}}
+
+@media (max-width: 900px) {{
+.dashboard-widgets {{
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+    align-items: stretch;
+    margin: 12px 0;
+}}
+
+@media (max-width: 600px) {{
+    .dashboard-widgets {{
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px;
+    }}
+
+    .flip-card-face {{
+        padding: 10px;
+        gap: 6px;
+    }}
+
+    .flip-card-front h2 {{
+        font-size: 17px;
+    }}
+
+    .flip-card-back h2 {{
+        font-size: 13px;
+    }}
+
+    .flip-card-back p {{
+        font-size: 10px;
+    }}
+}}
+
+@media (prefers-reduced-motion: reduce) {{
+    .flip-card-inner {{
+        transition: none;
+    }}
+}}
+
+
+@media (max-width: 600px) {{
+    .dashboard-widgets {{
+        grid-template-columns: minmax(0, 1fr);
+    }}
+
+    .flip-card {{
+        aspect-ratio: 1 / 0.72;
+        min-height: 250px;
+    }}
+}}
+
+@media (prefers-reduced-motion: reduce) {{
+    .flip-card-inner {{
+        transition: none;
+    }}
+}}
+
+
+/* Dashboard layout: two tiles across, two rows */
+.dashboard-widgets {{
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+    align-items: stretch;
+    margin: 12px 0;
+}}
+
+.dashboard-widgets > .flip-card {{
+    aspect-ratio: 1 / 0.72;
+    min-height: 0;
+    height: auto;
+}}
+
+.dashboard-widgets > .chart-widget {{
+    grid-column: 1 / -1;
+    min-width: 0;
+    padding: 12px;
+    margin: 0;
+}}
+
+/* Align the percentage scale with the graph */
+.subject-chart {{
+    display: grid;
+    grid-template-columns: 42px minmax(0, 1fr);
+    gap: 8px;
+    margin-top: 12px;
+    align-items: stretch;
+}}
+
+.chart-y-axis {{
+    height: 150px;
+    min-height: 150px;
+    padding-bottom: 27px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    align-items: flex-end;
+    font-size: 11px;
+    color: var(--muted);
+}}
+
+.chart-main {{
+    min-width: 0;
+    overflow-x: auto;
+}}
+
+.chart-plot {{
+    box-sizing: border-box;
+    width: 100%;
+    min-width: 360px;
+    height: 150px;
+    min-height: 150px;
+    max-height: 150px;
+    display: flex;
+    align-items: stretch;
+    gap: 10px;
+    background:
+        repeating-linear-gradient(
+            to top,
+            transparent 0,
+            transparent calc(20% - 1px),
+            var(--border) calc(20% - 1px),
+            var(--border) 20%
+        );
+    background-size: 100% calc(100% - 27px);
+    background-repeat: no-repeat;
+    border-bottom: 1px solid var(--border);
+}}
+
+.subject-column {{
+    flex: 1 1 0;
+    min-width: 58px;
+    height: 100%;
+    position: relative;
+}}
+
+.subject-plot-column {{
+    height: calc(100% - 27px);
+    position: relative;
+}}
+
+.subject-bar {{
+    position: absolute;
+    bottom: 0;
+    left: 25%;
+    width: 50%;
+    border-radius: 5px 5px 0 0;
+}}
+
+.subject-value {{
+    position: absolute;
+    left: 0;
+    width: 100%;
+    text-align: center;
+    font-size: 11px;
+    font-weight: bold;
+    color: var(--text);
+    white-space: nowrap;
+}}
+
+.subject-name {{
+    height: 27px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    text-align: center;
+    font-size: 10px;
+    color: var(--muted);
+    padding-top: 5px;
+}}
+
+.chart-x-title,
+.chart-y-title {{
+    text-align: center;
+    font-size: 11px;
+    color: var(--muted);
+    margin: 5px 0 0;
+}}
+
+/* Keep two tiles per row on smaller screens too */
+@media (max-width: 600px) {{
+    .dashboard-widgets {{
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px;
+    }}
+
+    .dashboard-widgets > .chart-widget {{
+        grid-column: 1 / -1;
+    }}
+
+    .flip-card-face {{
+        padding: 9px;
+    }}
+
+    .flip-card-front h2 {{
+        font-size: 16px;
+    }}
+}}
+
+
+/* Total learners: compact click-to-flip widget */
+.click-flip-card:hover .flip-card-inner,
+.click-flip-card:focus-within .flip-card-inner {{
+    transform: rotateY(0deg);
+}}
+
+.click-flip-card.is-flipped .flip-card-inner {{
+    transform: rotateY(180deg);
+}}
+
+.click-flip-card .flip-card-face {{
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+    padding: 12px;
+}}
+
+.click-flip-card .flip-card-face h2 {{
+    margin: 0;
+    font-size: 24px;
+}}
+
+.click-flip-card .flip-card-face p {{
+    margin: 3px 0;
+}}
+
+.click-flip-card .widget-flip-button {{
+    margin-top: auto;
+    padding: 7px 11px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: var(--surface, #ffffff);
+    color: var(--text);
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+}}
+
+.click-flip-card .widget-flip-button:hover {{
+    border-color: #3b82f6;
+}}
+
+.click-flip-card .learner-performance-list {{
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}}
+
+.click-flip-card .learner-performance-row {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+}}
+
+.click-flip-card .flip-card-back {{
+    overflow-y: auto;
+}}
+
+.click-flip-card .flip-card-back a {{
+    font-size: 12px;
+}}
+
+
+
+/* All dashboard tiles flip only when clicked */
+.flip-card .flip-card-inner {{
+    transition: transform 0.5s ease;
+    transform-style: preserve-3d;
+}}
+
+.flip-card.is-flipped .flip-card-inner {{
+    transform: rotateY(180deg);
+}}
+
+/* Do not flip automatically on hover */
+.flip-card:hover .flip-card-inner {{
+    transform: none;
+}}
+
+.flip-card.is-flipped:hover .flip-card-inner {{
+    transform: rotateY(180deg);
+}}
+
+.flip-card {{
+    cursor: pointer;
 }}
 
 
@@ -999,22 +1983,48 @@ def teacher_dashboard(request: Request):
     with DB() as db:
         user = require_role(request, db, "teacher")
 
+        # Load only learners belonging to this teacher's school.
         students = db.scalars(
-            select(Student).order_by(Student.grade, Student.name)
+            select(Student)
+            .where(Student.school_id == user.school_id)
+            .order_by(Student.grade, Student.name)
         ).all()
+
+        # Get the search term from the URL, if provided.
+        search_query = request.query_params.get("search", "").strip()
+
+        # Start with all learners, then filter if a search was entered.
+        matching_students = students
+
+        if search_query:
+            query_lower = search_query.casefold()
+            matching_students = [
+                s for s in students
+                if query_lower in (s.name or "").casefold()
+                or query_lower in (s.admission or "").casefold()
+            ]
 
         parents = db.scalars(
             select(User)
             .where(User.role == "parent")
+            .where(User.school_id == user.school_id)
             .order_by(User.email)
         ).all()
 
         results = db.scalars(
-            select(Result).order_by(Result.id.desc()).limit(50)
+            select(Result)
+            .join(Student, Result.student_id == Student.id)
+            .where(Student.school_id == user.school_id)
+            .order_by(Result.id.desc())
+            .limit(50)
         ).all()
 
         # Load every assessment for accurate dashboard statistics.
-        all_results = db.scalars(select(Result)).all()
+        all_results = db.scalars(
+            select(Result)
+            .join(Student, Result.student_id == Student.id)
+            .where(Student.school_id == user.school_id)
+        ).all()
 
         subject_scores = {}
         student_scores = {}
@@ -1049,7 +2059,6 @@ def teacher_dashboard(request: Request):
             sum(all_percentages) / len(all_percentages)
             if all_percentages else 0
         )
-
         best_subject = (
             max(subject_averages, key=subject_averages.get)
             if subject_averages else "No results yet"
@@ -1068,6 +2077,49 @@ def teacher_dashboard(request: Request):
         best_student_average = (
             sum(best_student["scores"]) / len(best_student["scores"])
             if best_student else 0
+        )
+
+        # Count assessed learners and calculate each learner's average.
+        learner_scores = {}
+
+        for result in all_results:
+            if result.maximum and result.maximum > 0:
+                learner_id = result.student.id
+                percentage = (result.marks / result.maximum) * 100
+                learner_scores.setdefault(learner_id, []).append(percentage)
+
+        assessed_learners = len(learner_scores)
+
+        learner_averages = [
+            sum(scores) / len(scores)
+            for scores in learner_scores.values()
+            if scores
+        ]
+
+        # Starter performance bands; these can be customized later.
+        performance_levels = {
+            "High (80–100%)": 0,
+            "On track (60–79.9%)": 0,
+            "Developing (40–59.9%)": 0,
+            "Needs support (below 40%)": 0,
+        }
+
+        for average in learner_averages:
+            if average >= 80:
+                performance_levels["High (80–100%)"] += 1
+            elif average >= 60:
+                performance_levels["On track (60–79.9%)"] += 1
+            elif average >= 40:
+                performance_levels["Developing (40–59.9%)"] += 1
+            else:
+                performance_levels["Needs support (below 40%)"] += 1
+
+        performance_rows = "".join(
+            f'<li class="learner-performance-row">'
+            f'<span>{label}</span>'
+            f'<strong>{count}</strong>'
+            f'</li>'
+            for label, count in performance_levels.items()
         )
 
         chart_rows = "".join(
@@ -1107,16 +2159,16 @@ def teacher_dashboard(request: Request):
         )
 
         learner_rows = "".join(
-           f"<tr>"
-           f"<td>{esc(s.admission or '—')}</td>"
-           f'<td><a href="/teacher/learner/{s.id}">{esc(s.name)}</a></td>'
-           f"<td>{s.grade}</td>"
-           f"<td>{len(s.results)}</td>"
-           f"</tr>"
-           for s in students
-) or (
-    '<tr><td colspan="4">No matching learners found.</td></tr>'
-) or '<tr><td colspan="4">No learners registered.</td></tr>'
+            f"<tr>"
+            f"<td>{esc(s.admission or '—')}</td>"
+            f'<td><a href="/teacher/learner/{s.id}">{esc(s.name)}</a></td>'
+            f"<td>{s.grade}</td>"
+            f"<td>{len(s.results)}</td>"
+            f"</tr>"
+            for s in students
+        ) or (
+            '<tr><td colspan="4">No matching learners found.</td></tr>'
+        ) or '<tr><td colspan="4">No learners registered.</td></tr>'
 
         result_rows = "".join(
             f"<tr><td>{esc(r.student.name)}</td>"
@@ -1136,39 +2188,149 @@ def teacher_dashboard(request: Request):
 
 
         <div class="dashboard-widgets">
-            <section class="stat-card">
-                <p class="summary-label">Total learners</p>
-                <h2>{len(students)}</h2>
-                <a href="/teacher/learners">View all learners</a>
-            </section>
+           
 
-            <section class="stat-card">
-                <p class="summary-label">Best subject</p>
-                <h2>{esc(best_subject)}</h2>
-                <span>
-                    {f"{subject_averages[best_subject]:.1f}% average"
-                     if best_subject in subject_averages
-                     else "No marks recorded"}
-                </span>
-            </section>
+<section class="stat-card flip-card click-flip-card total-learners-widget"
+         tabindex="0"
+         aria-label="Total learners and assessment overview"
+         onclick="this.classList.toggle('is-flipped')">
 
-            <section class="stat-card">
-                <p class="summary-label">Overall average score</p>
-                <h2>{overall_average:.1f}%</h2>
-                <span>Across all recorded assessments</span>
-            </section>
+    <div class="flip-card-inner">
 
-            <section class="stat-card">
-                <p class="summary-label">Best student</p>
-                <h2>
-                    {esc(best_student["name"] or "No results yet")
-                     if best_student else "No results yet"}
-                </h2>
-                <span>
-                    {f"{best_student_average:.1f}% average"
-                     if best_student else "No marks recorded"}
-                </span>
-            </section>
+        <div class="flip-card-face flip-card-front">
+            <p class="summary-label">Total learners</p>
+
+            <h2>{len(students)}</h2>
+
+            <p>Registered learners</p>
+
+            <button
+                type="button"
+                class="widget-flip-button"
+                onclick="this.closest('.click-flip-card').classList.toggle('is-flipped')">
+            
+<a
+    href="/teacher/analysis"
+    class="widget-flip-button"
+    onclick="event.stopPropagation()">
+    View analysis →
+</a>
+
+        </div>
+
+        <div class="flip-card-face flip-card-back">
+            <h2>Learner overview</h2>
+
+            <p>
+                <strong>{len(students)}</strong> learners are registered
+                at Yuri Academy.
+            </p>
+
+            <p>
+                <strong>{assessed_learners}</strong> learners have at least
+                one valid recorded assessment result.
+            </p>
+
+            <h3>Performance levels</h3>
+
+            <ul class="learner-performance-list">
+                {performance_rows}
+            </ul>
+
+            <a href="/teacher/learners">
+                View all learners →
+            </a>
+
+            <button
+                type="button"
+                class="widget-flip-button"
+                onclick="this.closest('.click-flip-card').classList.toggle('is-flipped')">
+                ← Back
+            </button>
+        </div>
+
+    </div>
+</section>
+
+<section class="stat-card flip-card"
+         tabindex="0"
+         onclick="this.classList.toggle('is-flipped')">
+    <div class="flip-card-inner">
+        <div class="flip-card-face flip-card-front">
+            <p class="summary-label">Best subject</p>
+            <h2>{esc(best_subject)}</h2>
+            <span>
+                {f"{subject_averages[best_subject]:.1f}% average"
+                 if best_subject in subject_averages
+                 else "No marks recorded"}
+            </span>
+        </div>
+        <div class="flip-card-face flip-card-back">
+            <h2>Subject analysis</h2>
+            <p>
+                {(
+                    f"{best_subject} currently has the highest recorded "
+                    f"subject average of {subject_averages[best_subject]:.1f}%."
+                )
+                if best_subject in subject_averages
+                else "Subject comparisons will appear when assessment marks are recorded."}
+            </p>
+        </div>
+    </div>
+</section>
+
+<section class="stat-card flip-card"
+         tabindex="0"
+         onclick="this.classList.toggle('is-flipped')">
+    <div class="flip-card-inner">
+        <div class="flip-card-face flip-card-front">
+            <p class="summary-label">Overall average</p>
+            <h2>{overall_average:.1f}%</h2>
+            <span>All recorded assessments</span>
+        </div>
+        <div class="flip-card-face flip-card-back">
+            <h2>Performance overview</h2>
+            <p>
+                This average is calculated from valid recorded assessment
+                percentages across the school.
+            </p>
+            <p>
+                Assessments included: {len(all_percentages)}
+            </p>
+        </div>
+    </div>
+</section>
+
+<section class="stat-card flip-card"
+         tabindex="0"
+         onclick="this.classList.toggle('is-flipped')">
+    <div class="flip-card-inner">
+        <div class="flip-card-face flip-card-front">
+            <p class="summary-label">Best student</p>
+            <h2>
+                {esc(best_student["name"] or "No results yet")
+                 if best_student else "No results yet"}
+            </h2>
+            <span>
+                {f"{best_student_average:.1f}% average"
+                 if best_student else "No marks recorded"}
+            </span>
+        </div>
+        <div class="flip-card-face flip-card-back">
+            <h2>Learner analysis</h2>
+            <p>
+                {(
+                    f"{esc(best_student['name'] or 'This learner')} has "
+                    f"the highest average among learners with recorded "
+                    f"results: {best_student_average:.1f}%."
+                )
+                if best_student else
+                "Learner performance analysis will appear when assessment marks are available."}
+            </p>
+        </div>
+    </div>
+</section>
+
 
             <section class="chart-widget">
                 <h2>Subject performance</h2>
@@ -1210,12 +2372,15 @@ def teacher_add_learner(request: Request):
         user = require_role(request, db, "teacher")
 
         students = db.scalars(
-            select(Student).order_by(Student.grade, Student.name)
+         select(Student)
+         .where(Student.school_id == user.school_id)
+         .order_by(Student.grade, Student.name)
         ).all()
 
         parents = db.scalars(
             select(User)
             .where(User.role == "parent")
+            .where(User.school_id == user.school_id)
             .order_by(User.email)
         ).all()
 
@@ -1475,14 +2640,22 @@ def teacher_all_learners(request: Request):
         user = require_role(request, db, "teacher")
 
         # Load learners in alphabetical order by grade and name.
+        
+
+        
         students = db.scalars(
-            select(Student).order_by(Student.grade, Student.name)
+            select(Student)
+            .where(Student.school_id == user.school_id)
+            .order_by(Student.grade, Student.name)
         ).all()
 
-        # Get the search term from the URL, if provided.
+        # Get the search term from the URL.
         search_query = request.query_params.get("search", "").strip()
+
+        # By default, include all learners from this school.
         matching_students = students
 
+        # Filter the learners when a search term is provided.
         if search_query:
             query_lower = search_query.casefold()
             matching_students = [
@@ -1490,6 +2663,8 @@ def teacher_all_learners(request: Request):
                 if query_lower in (s.name or "").casefold()
                 or query_lower in (s.admission or "").casefold()
             ]
+
+
 
         # Show 10 learners by default, or 10 search matches.
         page_number = max(1, int(request.query_params.get("page", "1")))
@@ -1515,7 +2690,13 @@ def teacher_all_learners(request: Request):
             '<tr><td colspan="4">No matching learners found.</td></tr>'
         )
 
-        total_learners = len(students)
+        total_learners = len(
+            db.scalars(
+                select(Student).where(
+                    Student.school_id == user.school_id
+                )
+            ).all()
+        )
         matching_count = len(matching_students)
 
         if search_query:
@@ -1620,6 +2801,306 @@ def teacher_all_learners(request: Request):
 
 
 
+@app.get("/teacher/analysis", response_class=HTMLResponse)
+def teacher_analysis(request: Request):
+    with DB() as db:
+        user = require_role(request, db, "teacher")
+
+        students = db.scalars(
+            select(Student)
+            .where(Student.school_id == user.school_id)
+            .order_by(Student.grade, Student.name)
+        ).all()
+
+        results = db.scalars(
+            select(Result)
+            .join(Student, Result.student_id == Student.id)
+            .where(Student.school_id == user.school_id)
+            .where(Result.maximum > 0)
+        ).all()
+
+
+        # Calculate each learner's average percentage.
+        learner_scores = {}
+
+        # Calculate average percentage for each subject.
+        subject_scores = {}
+
+        for result in results:
+            percentage = result.marks / result.maximum * 100
+
+            learner_scores.setdefault(
+                result.student_id, []
+            ).append(percentage)
+
+            subject_scores.setdefault(
+                result.subject, []
+            ).append(percentage)
+
+        learner_averages = {}
+
+        for student in students:
+            scores = learner_scores.get(student.id, [])
+            if scores:
+                learner_averages[student.id] = (
+                    sum(scores) / len(scores)
+                )
+
+        # Sort learners by average percentage.
+        ranked_students = sorted(
+            [
+                (student, learner_averages[student.id])
+                for student in students
+                if student.id in learner_averages
+            ],
+            key=lambda item: item[1],
+            reverse=True,
+        )
+
+        best_rows = "".join(
+            f"<tr>"
+            f"<td>{esc(student.name)}</td>"
+            f"<td>Grade {student.grade}</td>"
+            f"<td>{average:.1f}%</td>"
+            f"</tr>"
+            for student, average in ranked_students[:10]
+        ) or '<tr><td colspan="3">No assessment results yet.</td></tr>'
+
+        # Rank all assessed learners from highest to lowest average.
+        ranking_rows = "".join(
+            f"<tr>"
+            f"<td>{position}</td>"
+            f"<td>{esc(student.name)}</td>"
+            f"<td>Grade {student.grade}</td>"
+            f"<td>{average:.1f}%</td>"
+            f"<td>{'High' if average >= 80 else 'On track' if average >= 60 else 'Developing' if average >= 40 else 'Needs support'}</td>"
+            f"</tr>"
+            for position, (student, average) in enumerate(
+                ranked_students, start=1
+            )
+        ) or '<tr><td colspan="5">No assessment results available yet.</td></tr>' 
+
+        # Starter support threshold: below 40%.
+        support_students = [
+            (student, average)
+            for student, average in ranked_students
+            if average < 40
+        ]
+
+        support_rows = "".join(
+            f"<tr>"
+            f"<td>{esc(student.name)}</td>"
+            f"<td>Grade {student.grade}</td>"
+            f"<td>{average:.1f}%</td>"
+            f"<td>Review assessment gaps and provide support.</td>"
+            f"</tr>"
+            for student, average in support_students
+        ) or '<tr><td colspan="4">No learners currently fall below 40%.</td></tr>'
+
+        # Learners who have not yet been assessed.
+        unassessed = [
+            student for student in students
+            if student.id not in learner_averages
+        ]
+
+        unassessed_rows = "".join(
+            f"<tr>"
+            f"<td>{esc(student.name)}</td>"
+            f"<td>Grade {student.grade}</td>"
+            f"</tr>"
+            for student in unassessed
+        ) or '<tr><td colspan="2">All registered learners have assessment results.</td></tr>'
+
+        subject_averages = {
+            subject: sum(scores) / len(scores)
+            for subject, scores in subject_scores.items()
+            if scores
+        }
+
+        subject_rows = "".join(
+            f"<tr>"
+            f"<td>{esc(subject)}</td>"
+            f"<td>{average:.1f}%</td>"
+            f"</tr>"
+            for subject, average in sorted(
+                subject_averages.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+        ) or '<tr><td colspan="2">No subject results available yet.</td></tr>'
+
+        # Editable starter performance bands.
+        bands = {
+            "High: 80–100%": 0,
+            "On track: 60–79.9%": 0,
+            "Developing: 40–59.9%": 0,
+            "Needs support: below 40%": 0,
+        }
+
+        for average in learner_averages.values():
+            if average >= 80:
+                bands["High: 80–100%"] += 1
+            elif average >= 60:
+                bands["On track: 60–79.9%"] += 1
+            elif average >= 40:
+                bands["Developing: 40–59.9%"] += 1
+            else:
+                bands["Needs support: below 40%"] += 1
+
+        band_rows = "".join(
+            f"<tr><td>{label}</td><td>{count}</td></tr>"
+            for label, count in bands.items()
+        )
+
+        overall_average = (
+            sum(learner_averages.values())
+            / len(learner_averages)
+            if learner_averages else 0
+        )
+
+        body = f"""
+        <h1>Learner Performance Analysis</h1>
+        <p class="muted">
+            Analysis based on recorded assessment percentages.
+            A learner's average is calculated from their available results.
+        </p>
+
+        <p>
+            <a class="dashboard-button" href="/teacher">
+                ← Back to Teacher Dashboard
+            </a>
+        </p>
+
+        <div class="stat-grid">
+            <div class="stat-card">
+                <div class="stat-label">Registered learners</div>
+                <span class="stat-value">{len(students)}</span>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Learners assessed</div>
+                <span class="stat-value">{len(learner_averages)}</span>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Overall learner average</div>
+                <span class="stat-value">{overall_average:.1f}%</span>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Need extra support</div>
+                <span class="stat-value">{len(support_students)}</span>
+            </div>
+        </div>
+
+        <section>
+            <h2>Subject performance</h2>
+            <p class="muted">
+                Subjects are ranked by their average percentage.
+            </p>
+            <div class="table">
+                <table>
+                    <thead>
+                        <tr><th>Subject</th><th>Average</th></tr>
+                    </thead>
+                    <tbody>{subject_rows}</tbody>
+                </table>
+            </div>
+        </section>
+
+                <section>
+            <h2>Complete Learner Ranking</h2>
+            <p class="muted">
+                All assessed learners ranked by their average assessment
+                percentage, from highest to lowest.
+            </p>
+            <div class="table">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Rank</th>
+                            <th>Learner</th>
+                            <th>Grade</th>
+                            <th>Average Marks</th>
+                            <th>Performance</th>
+                        </tr>
+                    </thead>
+                    <tbody>{ranking_rows}</tbody>
+                </table>
+            </div>
+        </section>
+        <section>
+            <h2>Top-performing learners</h2>
+            <p class="muted">
+                The list shows the ten highest learner averages across
+                their available assessment results.
+            </p>
+            <div class="table">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Learner</th><th>Grade</th><th>Average</th>
+                        </tr>
+                    </thead>
+                    <tbody>{best_rows}</tbody>
+                </table>
+            </div>
+        </section>
+
+        <section>
+            <h2>Learners needing additional support</h2>
+            <p class="muted">
+                Starter rule: average below 40%. Review individual subjects
+                and assessments before deciding what intervention is needed.
+            </p>
+            <div class="table">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Learner</th><th>Grade</th>
+                            <th>Average</th><th>Suggested action</th>
+                        </tr>
+                    </thead>
+                    <tbody>{support_rows}</tbody>
+                </table>
+            </div>
+        </section>
+
+        <section>
+            <h2>Performance distribution</h2>
+            <p class="muted">
+                These are configurable percentage bands, not a claim
+                that every JSS school uses identical grade boundaries.
+            </p>
+            <div class="table">
+                <table>
+                    <thead>
+                        <tr><th>Performance band</th><th>Learners</th></tr>
+                    </thead>
+                    <tbody>{band_rows}</tbody>
+                </table>
+            </div>
+        </section>
+
+        <section>
+            <h2>Learners without recorded assessment results</h2>
+            <div class="table">
+                <table>
+                    <thead>
+                        <tr><th>Learner</th><th>Grade</th></tr>
+                    </thead>
+                    <tbody>{unassessed_rows}</tbody>
+                </table>
+            </div>
+        </section>
+        """
+
+        return page(
+            request,
+            "Learner Performance Analysis",
+            body,
+            user=user,
+        )
+
+
+
 @app.post("/teacher/learner/{student_id}/results/{result_id}/edit")
 def edit_learner_result(
     request: Request,
@@ -1657,15 +3138,26 @@ def edit_learner_result(
     with DB() as db:
         user = require_role(request, db, "teacher")
 
-        student = db.get(Student, student_id)
-        result = db.get(Result, result_id)
+        student = db.scalar(
+            select(Student).where(
+                Student.id == student_id,
+                Student.school_id == user.school_id,
+            )
+        )
 
-        if not student or not result or result.student_id != student_id:
+        result = db.scalar(
+            select(Result).where(
+                Result.id == result_id,
+                Result.student_id == student_id,
+                Result.student.has(Student.school_id == user.school_id),
+            )
+        )
+
+        if not student or not result:
             raise HTTPException(
                 status_code=404,
                 detail="Learner or assessment not found.",
             )
-
         result.subject = subject
         result.assessment = assessment
         result.result_date = parsed_date
@@ -1684,14 +3176,18 @@ def teacher_learner_profile(request: Request, student_id: int):
     with DB() as db:
         user = require_role(request, db, "teacher")
 
-        student = db.get(Student, student_id)
+        student = db.scalar(
+            select(Student).where(
+                Student.id == student_id,
+                Student.school_id == user.school_id,
+            )
+        )
 
         if not student:
             raise HTTPException(
                 status_code=404,
                 detail="Learner not found.",
             )
-
         results = sorted(
             student.results,
             key=lambda r: (r.result_date, r.subject),
@@ -2138,7 +3634,12 @@ def add_teacher_remark(
     with DB() as db:
         teacher = require_role(request, db, "teacher")
 
-        student = db.get(Student, student_id)
+        student = db.scalar(
+            select(Student).where(
+                Student.id == student_id,
+                Student.school_id == teacher.school_id,
+            )
+        )
 
         if not student:
             raise HTTPException(
@@ -2173,7 +3674,7 @@ def add_student(
     check_csrf(request, csrf_token)
 
     with DB() as db:
-        require_role(request, db, "teacher")
+        teacher = require_role(request, db, "teacher")
 
         name = name.strip()
         admission = admission.strip() or None
@@ -2185,12 +3686,20 @@ def add_student(
             raise HTTPException(400, "Grade must be 7, 8 or 9.")
 
         if admission and db.scalar(
-            select(Student).where(Student.admission == admission)
+            select(Student).where(
+                Student.admission == admission,
+                Student.school_id == teacher.school_id,
+            )
         ):
             raise HTTPException(400, "That admission number already exists.")
 
         db.add(
-            Student(name=name, grade=grade, admission=admission)
+            Student(
+                name=name,
+                grade=grade,
+                admission=admission,
+                school_id=teacher.school_id,
+            )
         )
         db.commit()
 
@@ -2207,7 +3716,7 @@ def add_parent(
     check_csrf(request, csrf_token)
 
     with DB() as db:
-        require_role(request, db, "teacher")
+        teacher = require_role(request, db, "teacher")
 
         email = email.strip().lower()
 
@@ -2226,6 +3735,7 @@ def add_parent(
                 email=email,
                 password_hash=passwords.hash(password),
                 role="parent",
+                school_id=teacher.school_id,
             )
         )
         db.commit()
@@ -2334,7 +3844,7 @@ def link_parent(
     check_csrf(request, csrf_token)
 
     with DB() as db:
-        require_role(request, db, "teacher")
+        teacher = require_role(request, db, "teacher")
 
         parent = db.get(User, parent_id)
         student = db.get(Student, student_id)
@@ -2402,7 +3912,7 @@ def add_result(
 
         duplicate = db.scalar(
             select(Result).where(
-                Result.student_id == student_id,
+                Result.student_id == student.id,
                 Result.subject == subject,
                 Result.assessment == assessment,
                 Result.result_date == parsed_date,
@@ -2416,7 +3926,7 @@ def add_result(
 
         db.add(
             Result(
-                student_id=student_id,
+                student_id=student.id,
                 subject=subject,
                 assessment=assessment,
                 result_date=parsed_date,
@@ -2535,7 +4045,7 @@ def worksheet_settings(db):
 @app.get("/import/settings", response_class=HTMLResponse)
 def import_settings_page(request: Request):
     with DB() as db:
-        user = require_role(request, db, "teacher")
+        teacher = require_role(request, db, "teacher")
         names = worksheet_settings(db)
 
         fields = [
@@ -2580,7 +4090,7 @@ def import_settings_page(request: Request):
         </section>
         """
 
-        return page(request, "Excel Import Settings", body, user)
+        return page(request, "Excel Import Settings", body, teacher)
 
 
 @app.post("/import/settings/save")
@@ -2612,7 +4122,7 @@ def save_import_settings(
         )
 
     with DB() as db:
-        require_role(request, db, "teacher")
+        teacher = require_role(request, db, "teacher")
 
         for key, value in values.items():
             set_setting(db, key, value)
@@ -2886,7 +4396,12 @@ def read_wide_marks(ws):
                 "assessment": assessment,
                 "date": result_date,
                 "marks": raw_mark,
-                "maximum": values.get("maximum") or 100,
+                "maximum": (
+    values["maximum"]
+    if values.get("maximum") is not None
+    and cell_text(values.get("maximum"))
+    else 100
+),
                 "_row": row_number,
             })
 
@@ -2955,13 +4470,40 @@ def read_import_workbook_mode(contents, names, mode):
             )
 
         if mode in ("marks_only", "full"):
-            marks = read_records(
-                workbook[names["marks_sheet"]],
-                [
-                    "admission", "subject", "assessment",
-                    "date", "marks", "maximum",
-                ],
+            marks_ws = workbook[names["marks_sheet"]]
+            first_row = next(
+                marks_ws.iter_rows(
+                    min_row=1, max_row=1, values_only=True
+                ),
+                (),
             )
+            aliases = {
+                normalize_header(alias): standard
+                for standard, alternatives in HEADER_ALIASES.items()
+                for alias in alternatives | {standard}
+            }
+            normalized_headers = [
+                aliases.get(
+                    normalize_header(value),
+                    normalize_header(value),
+                )
+                for value in first_row
+            ]
+            long_format_headers = {
+                "admission", "subject", "assessment",
+                "date", "marks", "maximum",
+            }
+
+            if long_format_headers.issubset(set(normalized_headers)):
+                marks = read_records(
+                    marks_ws,
+                    [
+                        "admission", "subject", "assessment",
+                        "date", "marks", "maximum",
+                    ],
+                )
+            else:
+                marks = read_wide_marks(marks_ws)
 
         return learners, parents, links, marks
 
@@ -3055,7 +4597,7 @@ def read_import_workbook(contents, names):
         workbook.close()
 
 
-def validate_workbook(db, learners, parents, links, marks):
+def validate_workbook(db, learners, parents, links, marks, school_id):
     errors = []
     learner_admissions = set()
     parent_emails = set()
@@ -3143,6 +4685,7 @@ def validate_workbook(db, learners, parents, links, marks):
                 select(User).where(
                     User.email == email,
                     User.role == "parent",
+                    User.school_id == school_id
                 )
             ) is not None
         )
@@ -3151,7 +4694,8 @@ def validate_workbook(db, learners, parents, links, marks):
             admission in learner_admissions
             or db.scalar(
                 select(Student).where(
-                    Student.admission == admission
+                    Student.admission == admission,
+                    Student.school_id == school_id
                 )
             ) is not None
         )
@@ -3178,7 +4722,8 @@ def validate_workbook(db, learners, parents, links, marks):
             admission in learner_admissions
             or db.scalar(
                 select(Student).where(
-                    Student.admission == admission
+                    Student.admission == admission,
+                    Student.school_id == school_id
                 )
             ) is not None
         )
@@ -3336,7 +4881,7 @@ async def import_preview(
             )
 
             errors = validate_workbook(
-                db, learners, parents, links, marks
+                db, learners, parents, links, marks, user.school_id
             )
 
             if errors:
@@ -3563,7 +5108,9 @@ def import_confirm(
             for item in data["parents"]:
                 existing = db.scalar(
                     select(User).where(
-                        User.email == item["email"]
+                        User.email == item["email"],
+                        User.school_id == user.school_id,
+                        User.role == "parent"
                     )
                 )
 
@@ -3579,6 +5126,7 @@ def import_confirm(
                     name=item["name"],
                     grade=item["grade"],
                     admission=item["admission"],
+                    school_id=user.school_id,
                 )
 
                 db.add(student)
@@ -3597,6 +5145,7 @@ def import_confirm(
                         temporary_password
                     ),
                     role="parent",
+                    school_id=user.school_id,
                 )
 
                 db.add(parent)
@@ -3622,6 +5171,7 @@ def import_confirm(
                         select(User).where(
                             User.email == item["parent_email"],
                             User.role == "parent",
+                            User.school_id == user.school_id
                         )
                     )
 
@@ -3632,7 +5182,8 @@ def import_confirm(
                 if not student:
                     student = db.scalar(
                         select(Student).where(
-                            Student.admission == item["admission"]
+                            Student.admission == item["admission"],
+                            Student.school_id == user.school_id
                         )
                     )
 
@@ -3653,7 +5204,8 @@ def import_confirm(
                 if not student:
                     student = db.scalar(
                         select(Student).where(
-                            Student.admission == item["admission"]
+                            Student.admission == item["admission"],
+                            Student.school_id == user.school_id
                         )
                     )
 
@@ -3670,6 +5222,7 @@ def import_confirm(
                         Result.subject == item["subject"],
                         Result.assessment == item["assessment"],
                         Result.result_date == assessment_date,
+                        Result.school_id == user.school_id,
                     )
                 )
 
@@ -3688,6 +5241,7 @@ def import_confirm(
                         result_date=assessment_date,
                         marks=item["marks"],
                         maximum=item["maximum"],
+                        school_id=user.school_id,
                     )
                 )
 
