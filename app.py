@@ -31,7 +31,25 @@ load_dotenv(override=True)
 
 SCHOOL = os.getenv("SCHOOL_NAME", "Yuri Academy")
 print("SCHOOL NAME LOADED:", SCHOOL)
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./school.db")
+
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "sqlite:///./school.db",
+)
+
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace(
+        "postgres://",
+        "postgresql+psycopg://",
+        1,
+    )
+elif DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace(
+        "postgresql://",
+        "postgresql+psycopg://",
+        1,
+    )
+
 SECRET = os.getenv("SESSION_SECRET", "")
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
 APP_ENV = os.getenv("APP_ENV", "development").lower()
@@ -108,7 +126,7 @@ if DATABASE_URL.startswith("sqlite"):
 DB = sessionmaker(bind=engine, expire_on_commit=False)
 passwords = PasswordHash.recommended()
 
-app = FastAPI(title="JSS Assessment Dashboard")
+app = FastAPI(title="EduTrack Kenya")
 
 app.add_middleware(
     SessionMiddleware,
@@ -537,7 +555,7 @@ def set_setting(db, key, value):
 
 
 def page(request, title, body, user=None, status_code=200):
-    """Render every page with the shared bright-first JSS layout."""
+    """Render every page with the shared EduTrack Kenya layout."""
     destination = "/teacher" if user and user.role == "teacher" else "/parent"
     sidebar = ""
 
@@ -1667,7 +1685,7 @@ th {{
 </head>
 <body>
 <header class="topbar">
-  <a class="brand" href="{destination if user else '/login'}"><span class="brand-mark">🎓</span><span>{esc(SCHOOL)}<br><small>Assessment Portal</small></span></a>
+  <a class="brand" href="{destination if user else '/login'}"><span class="brand-mark">🎓</span><span>EduTrack Kenya<br><small>{esc(SCHOOL)} · Assessment Portal</small></span></a>
   <div class="top-actions">{('<a href="/settings" title="Settings">⚙ Settings</a><span title="Account">♙</span>' if user else '')}</div>
 </header>
 <div class="app-shell">
@@ -3089,7 +3107,7 @@ def teacher_analysis(request: Request):
             <h2>Performance distribution</h2>
             <p class="muted">
                 These are configurable percentage bands, not a claim
-                that every JSS school uses identical grade boundaries.
+                that every school level uses identical grade boundaries.
             </p>
             <div class="table">
                 <table>
@@ -4058,7 +4076,7 @@ def general_settings_page(request: Request):
 
         body = f"""
         <h1>Settings</h1>
-        <p>Personalise how the JSS Assessment System looks on this device.</p>
+        <p>Personalise how EduTrack Kenya looks on this device.</p>
         <section>
             <h2>Appearance</h2>
             <div class="theme-row">
