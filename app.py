@@ -54,7 +54,7 @@ SUBJECTS = [
     "Life Skills Education",
 ]
 
-GRADES = [7, 8, 9]
+GRADES = list(range(1, 13))
 
 DEFAULT_SHEETS = {
     "learners_sheet": "Learners",
@@ -3124,10 +3124,19 @@ def edit_learner_result(
     if not assessment or len(assessment) > 120:
         raise HTTPException(status_code=400, detail="Invalid assessment name.")
 
-    if marks < 0 or maximum <= 0 or marks > maximum:
+
+    if not (
+        math.isfinite(marks)
+        and math.isfinite(maximum)
+        and maximum > 0
+        and 0 <= marks <= maximum
+    ):
         raise HTTPException(
             status_code=400,
-            detail="Marks must be between zero and the maximum marks.",
+            detail=(
+                "Invalid marks. The mark must be between "
+                "zero and a positive maximum."
+            ),
         )
 
     try:
@@ -3516,19 +3525,19 @@ def parent_learner_profile(request: Request, student_id: int):
         )
 
         result_rows = "".join(
-            f"""
-            <tr>
-                <td>{esc(r.subject)}</td>
-                <td>{esc(r.assessment)}</td>
-                <td>{r.result_date.strftime('%d %b %Y')}</td>
-                <td>{r.marks:g} / {r.maximum:g}</td>
-                <td>
-                    {r.marks / r.maximum * 100:.1f}%
-                </td>
-            </tr>
-            """
-            for r in results
-        ) or """
+    f"""
+    <tr>
+        <td>{esc(r.subject)}</td>
+        <td>{esc(r.assessment)}</td>
+        <td>{r.result_date.strftime('%d %b %Y')}</td>
+        <td>{r.marks:g} / {r.maximum:g}</td>
+        <td>
+            {f"{r.marks / r.maximum * 100:.1f}%" if r.maximum > 0 else "Invalid maximum"}
+        </td>
+    </tr>
+    """
+    for r in results
+) or """
             <tr>
                 <td colspan="5">No assessment results recorded yet.</td>
             </tr>
@@ -3683,7 +3692,7 @@ def add_student(
             raise HTTPException(400, "Learner name is required.")
 
         if grade not in GRADES:
-            raise HTTPException(400, "Grade must be 7, 8 or 9.")
+            raise HTTPException(400, "Grade must be between 1 and 12.")
 
         if admission and db.scalar(
             select(Student).where(
@@ -3858,7 +3867,8 @@ def link_parent(
             parent.children.append(student)
             db.commit()
 
-    return go("/teacher/add-learner")
+            return go("/teacher/add-learner")
+
 
 
 # ============================================================
@@ -3879,9 +3889,17 @@ def add_result(
     check_csrf(request, csrf_token)
 
     with DB() as db:
-        require_role(request, db, "teacher")
+        teacher = require_role(request, db, "teacher")
 
-        student = db.get(Student, student_id)
+        # Only allow the teacher to record results for
+        # learners belonging to the teacher's own school.
+        student = db.scalar(
+            select(Student).where(
+                Student.id == student_id,
+                Student.school_id == teacher.school_id,
+            )
+        )
+
         assessment = assessment.strip()
 
         if (
@@ -3891,7 +3909,8 @@ def add_result(
             or len(assessment) > 120
         ):
             raise HTTPException(
-                400, "Select a valid learner, subject and assessment."
+                status_code=400,
+                detail="Select a valid learner, subject and assessment.",
             )
 
         if (
@@ -3902,13 +3921,17 @@ def add_result(
             or marks > maximum
         ):
             raise HTTPException(
-                400, "Marks must be between zero and maximum marks."
+                status_code=400,
+                detail="Marks must be between zero and maximum marks.",
             )
 
         try:
             parsed_date = date.fromisoformat(result_date)
         except ValueError:
-            raise HTTPException(400, "Enter a valid date.")
+            raise HTTPException(
+                status_code=400,
+                detail="Enter a valid date.",
+            )
 
         duplicate = db.scalar(
             select(Result).where(
@@ -3921,7 +3944,8 @@ def add_result(
 
         if duplicate:
             raise HTTPException(
-                400, "This result already exists."
+                status_code=400,
+                detail="This result already exists.",
             )
 
         db.add(
@@ -3936,8 +3960,7 @@ def add_result(
         )
         db.commit()
 
-    return go("/teacher/add-learner")
-
+        return go("/teacher/add-learner")
 
 # ============================================================
 # 10. PARENT DASHBOARD
@@ -4607,26 +4630,32 @@ def validate_workbook(db, learners, parents, links, marks, school_id):
     for row in learners:
         admission = cell_text(row.get("admission"))
         name = cell_text(row.get("name"))
-        grade = row.get("grade")
         try:
             grade_value = float(row.get("grade"))
+
+            if not math.isfinite(grade_value) or not grade_value.is_integer():
+                raise ValueError
+
             grade = int(grade_value)
 
-            if grade_value != grade:
-                raise ValueError
-        except (TypeError, ValueError):
-            grade = 0
-
-        if not admission or not name:
+        except (TypeError, ValueError, OverflowError):
             errors.append(
                 f"Learners row {row['_row']}: "
-                "admission and name are required."
+                "grade must be a whole number between 1 and 12."
             )
+            continue
 
         if grade not in GRADES:
             errors.append(
                 f"Learners row {row['_row']}: "
-                "grade must be 7, 8 or 9."
+                "grade must be between 1 and 12."
+            )
+            continue
+
+        if grade not in GRADES:
+            errors.append(
+                f"Learners row {row['_row']}: "
+                "grade must be between 1 and 12."
             )
 
         if admission in learner_admissions:
@@ -4750,18 +4779,23 @@ def validate_workbook(db, learners, parents, links, marks, school_id):
             score = float(row.get("marks"))
             maximum = float(row.get("maximum"))
 
-            if not (
-                math.isfinite(score)
-                and math.isfinite(maximum)
-                and 0 <= score <= maximum
-                and maximum > 0
-            ):
-                raise ValueError
+            if not math.isfinite(score) or not math.isfinite(maximum):
+                raise ValueError("Marks and maximum must be finite numbers.")
 
-        except (TypeError, ValueError, OverflowError):
+            if maximum <= 0:
+                raise ValueError("Maximum mark must be greater than zero.")
+
+            if score < 0:
+                raise ValueError("Mark cannot be negative.")
+
+            if score > maximum:
+                raise ValueError(
+                    f"Mark {score:g} exceeds maximum {maximum:g}."
+                )
+
+        except (TypeError, ValueError, OverflowError) as exc:
             errors.append(
-                f"AssessmentMarks row {row['_row']}: "
-                "marks must be finite numbers between zero and maximum."
+                f"AssessmentMarks row {row['_row']}: {exc}"
             )
             continue
 
@@ -5195,8 +5229,30 @@ def import_confirm(
                 if student not in parent.children:
                     parent.children.append(student)
 
+
             # Save marks. Multiple subjects per learner are supported.
             for item in data["marks"]:
+                # Validate the score before saving it.
+                try:
+                    score = float(item["marks"])
+                    maximum = float(item["maximum"])
+
+                    if not (
+                        math.isfinite(score)
+                        and math.isfinite(maximum)
+                        and maximum > 0
+                        and 0 <= score <= maximum
+                    ):
+                        raise ValueError
+
+                except (TypeError, ValueError, OverflowError):
+                    raise ValueError(
+                        f"Invalid marks for admission "
+                        f"{item.get('admission', 'unknown')}: "
+                        "marks must be between zero and a "
+                        "positive maximum."
+                    )
+
                 student = learners_by_admission.get(
                     item["admission"]
                 )
@@ -5217,14 +5273,17 @@ def import_confirm(
                 assessment_date = date.fromisoformat(item["date"])
 
                 duplicate = db.scalar(
-                    select(Result).where(
+                    select(Result)
+                    .join(Student, Result.student_id == Student.id)
+                    .where(
                         Result.student_id == student.id,
+                        Student.school_id == user.school_id,
                         Result.subject == item["subject"],
                         Result.assessment == item["assessment"],
                         Result.result_date == assessment_date,
-                        Result.school_id == user.school_id,
                     )
                 )
+
 
                 if duplicate:
                     raise ValueError(
@@ -5239,9 +5298,8 @@ def import_confirm(
                         subject=item["subject"],
                         assessment=item["assessment"],
                         result_date=assessment_date,
-                        marks=item["marks"],
-                        maximum=item["maximum"],
-                        school_id=user.school_id,
+                        marks=score,
+                        maximum=maximum,
                     )
                 )
 

@@ -2,6 +2,8 @@
 # Python virtual environments
 .venv/
 .venv-2/
+.venv-1/
+.venv-3/
 venv/
 
 # Python cache
@@ -12,6 +14,8 @@ __pycache__/
 .env
 .env.*
 !.env.example
+.venv-1/
+.venv-3/
 
 # Private data and spreadsheets
 *.xlsx
