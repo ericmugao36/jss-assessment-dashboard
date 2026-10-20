@@ -1733,9 +1733,31 @@ def create_initial_teacher():
             select(User).where(User.email == email)
         )
 
+
         if not existing:
+            school = db.scalar(
+                select(School).where(
+                    School.name == SCHOOL
+                )
+            )
+
+            if not school:
+                print(
+                    f"Cannot create initial teacher: "
+                    f"school '{SCHOOL}' was not found."
+                )
+                return
+
+            if school.status != "active":
+                print(
+                    f"Cannot create initial teacher: "
+                    f"school '{SCHOOL}' is not active."
+                )
+                return
+
             db.add(
                 User(
+                    school_id=school.id,
                     email=email,
                     password_hash=passwords.hash(password),
                     role="teacher",
