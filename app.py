@@ -1,4 +1,4 @@
-import os
+﻿import os
 import json
 import html
 import math
@@ -30,6 +30,10 @@ from openpyxl import load_workbook
 load_dotenv(override=True)
 
 SCHOOL = os.getenv("SCHOOL_NAME", "Your School")
+PORTAL_SUBTITLE = os.getenv(
+    "PORTAL_SUBTITLE",
+    "Assessment Portal"
+)
 print("SCHOOL NAME LOADED:", SCHOOL)
 
 DATABASE_URL = os.getenv(
@@ -1685,7 +1689,7 @@ th {{
 </head>
 <body>
 <header class="topbar">
-  <a class="brand" href="{destination if user else '/login'}"><span class="brand-mark">🎓</span><span>EduTrack Kenya<br><small>{esc(SCHOOL)} · Assessment Portal</small></span></a>
+  <a class="brand" href="{destination if user else '/login'}"><span class="brand-mark">🎓</span><span>EduTrack Kenya<br><small>{esc(SCHOOL)} · {esc(PORTAL_SUBTITLE)}</small></span></a>
   <div class="top-actions">{('<a href="/settings" title="Settings">⚙ Settings</a><span title="Account">♙</span>' if user else '')}</div>
 </header>
 <div class="app-shell">
