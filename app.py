@@ -29,7 +29,7 @@ from openpyxl import load_workbook
 
 load_dotenv(override=True)
 
-SCHOOL = os.getenv("SCHOOL_NAME", "Yuri Academy")
+SCHOOL = os.getenv("SCHOOL_NAME", "Your School")
 print("SCHOOL NAME LOADED:", SCHOOL)
 
 DATABASE_URL = os.getenv(
@@ -381,13 +381,13 @@ with engine.begin() as connection:
             )
         )
 
-    # Create the initial Yuri Academy school record if needed.
+    # Create the initial configured school record if needed.
     school_id = connection.execute(
         text(
             "SELECT id FROM schools "
             "WHERE name = :name LIMIT 1"
         ),
-        {"name": "Yuri Academy"},
+        {"name": SCHOOL},
     ).scalar_one_or_none()
 
     if school_id is None:
@@ -409,7 +409,7 @@ VALUES (
                 """
             ),
             {
-                "name": "Yuri Academy",
+                "name": SCHOOL,
                 "teacher_limit": 100,
                 "status": "active",
                 "created_at": datetime.utcnow(),
@@ -421,10 +421,10 @@ VALUES (
                 "SELECT id FROM schools "
                 "WHERE name = :name LIMIT 1"
             ),
-            {"name": "Yuri Academy"},
+            {"name": SCHOOL},
         ).scalar_one()
 
-    # Associate existing users with Yuri Academy.
+    # Associate existing users with the configured school.
     connection.execute(
         text(
             "UPDATE users SET school_id = :school_id "
@@ -448,7 +448,7 @@ VALUES (
             )
         )
 
-    # Assign existing learners to Yuri Academy.
+    # Assign existing learners to the configured school.
     connection.execute(
         text(
             "UPDATE students SET school_id = :school_id "
@@ -2263,7 +2263,7 @@ def teacher_dashboard(request: Request):
 
             <p>
                 <strong>{len(students)}</strong> learners are registered
-                at Yuri Academy.
+                at this school.
             </p>
 
             <p>
